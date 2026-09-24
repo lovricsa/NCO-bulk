@@ -1,0 +1,1183 @@
+---
+title: "Bulk differential expression analysis of 'Neuroblastoma results' manuscript"
+date: "`r Sys.Date()`"
+author: "Anna Lovrics"
+output:
+  html_document:
+    css: assets/rany_style.css
+    df_print: paged
+    highlight: tango
+    theme: cosmo
+    toc: yes
+    toc_float:
+      collapsed: true
+    number_sections: true
+    code_folding: hide
+---
+
+
+```{r setup, include=F}
+knitr::opts_chunk$set(message=FALSE, warnings=FALSE, fig.width=12, fig.height=5)
+```
+
+The code is under GNU GPL-3 license (https://www.gnu.org/licenses/gpl-3.0.html).
+
+The objective of this R Markdown code is to reproduce bulk RNA-seq analysis
+in the publication Tusnády et al.: 
+
+```{r libraries}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+packages <- c(
+  "ggplot2", "ggrepel",    # for some plots
+  "tidyverse",            # Includes ggplot2, dplyr, tidyr, readr, purrr, forcats, tibble
+  "limma",                # Differential expression analysis
+  "edgeR",                # Normalization and DGEList
+  "SummarizedExperiment", # Reading SummarizedExperiment assay data
+  "ComplexHeatmap",       # Heatmap plotting & annotations
+  "openxlsx",             # Writing Excel files
+  "here",                 # Relative path management
+  "AnnotationDbi",        # Database mapping
+  "org.Hs.eg.db",         # Human gene annotation database
+  "rtracklayer",          # Importing GTF annotation files
+  "msigdbr", 
+  "org.Hs.eg.db",
+  "AnnotationDbi" 
+)
+# Load all packages quietly
+invisible(lapply(packages, library, character.only = TRUE))
+```
+
+```{r folder structure}
+
+Datafolder     <- here("Data")
+# Subdirectories specifically isolated for this run's outputs
+Figures   <- here(file.path("Figures", "reference_mapping"))
+Data_calc <- here("Data_calculated")
+Data_public <- here("Data_public")
+Gencode_folder <- here("Gencode")
+Results   <- here("Results")
+
+# mainfolder <- "/home/anna/Anna/Enzimhome_local/Projects/Neuroblastoma"
+datafolder <- here("Data") # here("Results_trimmed_321")
+calcfolder <- here("Data_calculated")
+if (!file.exists(calcfolder)) dir.create(calcfolder)
+figfolder <- here("Figures")
+if (!file.exists(figfolder)) dir.create(figfolder)
+resfolder <- here("Results")
+if (!file.exists(resfolder)) dir.create(resfolder)
+```
+
+Input for differential analysis is the count matrix, samples annotation and the design table. Gene annotation is also provided.
+```{r read in input data}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+
+# Read in TSV input data uploaded to GEO
+counts_file <- file.path(datafolder, "GSE335741_salmon.merged.gene_counts.tsv")
+tpm_file    <- file.path(datafolder, "GSE335741_salmon.merged.gene_tpm.tsv")
+
+# Read gene counts table
+counts_df <- read.delim(counts_file, check.names = FALSE)
+
+# Extract gene IDs / names if present in the TSV columns
+# typical nf-core TSV format has 'gene_id' and 'gene_name' as first columns
+if ("gene_name" %in% colnames(counts_df)) {
+  gene_ids <- counts_df$gene_id
+  counts <- as.matrix(counts_df[, -(1:2)])
+  rownames(counts) <- gene_ids
+} else {
+  gene_ids <- counts_df[, 1]
+  counts <- as.matrix(counts_df[, -1])
+  rownames(counts) <- gene_ids
+}
+
+# Clean column names in count matrix to match downstream code
+#colnames(counts) <- sub("_trimmed$", "", colnames(counts))
+
+# Read sample metadata
+annot_file <- file.path(datafolder, "samplesheet.csv")
+metadata_scaled <- read.csv(annot_file)
+samples_split <- strsplit2(metadata_scaled$sample, "_")
+metadata_scaled$Cell_Line <- samples_split[,2]
+metadata_scaled$Target <- paste(samples_split[,3], samples_split[,4], sep="_")
+metadata_scaled$gRNA <- samples_split[,5]
+sample_names <- metadata_scaled$sample
+
+# metadata_scaled <- data.frame(Sample = sample_names)
+# metadata_scaled$ID <- sub("_trimmed$", "", metadata_scaled$Sample)
+# split_parts <- strsplit(metadata_scaled$ID, "_")
+# 
+metadata_scaled$Cell_Line <- factor(metadata_scaled$Cell_Line) 
+metadata_scaled$Target <- factor(metadata_scaled$Target) 
+metadata_scaled$gRNA <- factor(metadata_scaled$gRNA) 
+
+# Re-level factors for a cleaner default contrast
+metadata_scaled$Cell_Line <- relevel(metadata_scaled$Cell_Line, ref = "H1")
+metadata_scaled$Target <- relevel(metadata_scaled$Target, ref = "STOP_MYCN")
+metadata_scaled$gRNA <- relevel(metadata_scaled$gRNA, ref = "gRNA1")
+
+# Ensure count matrix columns match metadata sample IDs
+counts <- counts[, metadata_scaled$sample]
+
+# Additive Design Matrix
+design_additive <- model.matrix(~ Cell_Line + Target + gRNA, data = metadata_scaled)
+rownames(design_additive) <- metadata_scaled$sample
+
+# Read in genes annotation:
+gene_annot_file <- file.path(Gencode_folder, "gencode.v49.primary_assembly.annotation.rds")
+if (!file.exists(gene_annot_file)){
+  gtf_file <- file.path(Gencode_folder, "gencode.v49.primary_assembly.annotation.gtf")
+  gtf <- rtracklayer::import(gtf_file)
+  
+  # Extract gene-level annotations
+  gene_annot <- gtf %>%
+    as.data.frame() %>%
+    filter(type == "gene") %>%
+    select(gene_id, gene_name, gene_type,
+           seqnames, start, end, strand)
+  # save
+  saveRDS(gene_annot, gene_annot_file)
+} else {
+  gene_annot <- readRDS(gene_annot_file)
+}
+```
+
+
+Calculate and save normalised expression.
+```{r calculate normalised expression}
+# Convert count matrix to DGEList object
+dge <- edgeR::DGEList(counts = counts)
+
+# Perform filtering to remove genes with low counts
+keep <- filterByExpr(dge, design_additive)
+dge <- dge[keep, , keep.lib.sizes = FALSE]
+
+# Apply TMM normalization
+dge <- calcNormFactors(dge)
+
+# Apply voom normalization
+vv <- voom(dge, design_additive, plot = FALSE)
+
+# Save & plot intermediate results
+exprmx <- as_tibble(vv$E, rownames = "gene_id")
+print(dim(exprmx))
+
+# Merge with gene annotation
+exprmx <- right_join(gene_annot, exprmx, by = "gene_id")
+print(dim(exprmx))
+
+exprfile <- file.path(resfolder, "logCPM.xlsx")
+write.xlsx(exprmx, file = exprfile, colNames = TRUE, rowNames = FALSE)
+
+# Load TPM counts table directly from Salmon GEO file
+tpm_raw <- read.delim(tpm_file, check.names = FALSE)
+
+if ("gene_name" %in% colnames(tpm_raw)) {
+  tpm_ids <- tpm_raw$gene_id
+  tpm_mat <- as.matrix(tpm_raw[, -(1:2)])
+  rownames(tpm_mat) <- tpm_ids
+} else {
+  tpm_ids <- tpm_raw[, 1]
+  tpm_mat <- as.matrix(tpm_raw[, -1])
+  rownames(tpm_mat) <- tpm_ids
+}
+
+# Filter TPM matrix to retain the same filtered genes and matching sample order
+tpm_filtered <- tpm_mat[rownames(dge$counts), metadata_scaled$sample]
+
+# Save TPM table
+tpm_df <- as_tibble(tpm_filtered, rownames = "gene_id")
+tpm_df <- right_join(gene_annot, tpm_df, by = "gene_id")
+
+# Write to Excel
+exprfile <- file.path(resfolder, "TPM.xlsx")
+write.xlsx(tpm_df, file = exprfile, colNames = TRUE, rowNames = FALSE)
+```
+
+Show the expression of these genes on a dot plot
+```{r dotplot for selected genes}
+hox_list <- list(
+  "Cervical" = c("HOXA1", "HOXB1", "HOXA3", "HOXB3", "HOXD3"),
+  "Truncal" = c("HOXA5", "HOXB5", "HOXA6", "HOXA7", "HOXB7", "HOXB8", "HOXC8", "HOXD8", "HOXB9"),
+  "Lumbar-caudal" = c("HOXC9", "HOXD9", "HOXD11")
+)
+gene_order <- unlist(hox_list) 
+
+# Convert your hox_list into a lookup table (dataframe)
+hox_mapping <- stack(hox_list)
+colnames(hox_mapping) <- c("gene_name", "gene_group")
+
+# Ensure gene_group is a factor with the correct order for the facets
+hox_mapping$gene_group <- factor(hox_mapping$gene_group, 
+                                 levels = c("Cervical", "Truncal", "Lumbar-caudal"))
+
+# Join this mapping back to your plotting data
+exprmx_long_TPM <- tpm_df[, c("gene_name", metadata_scaled$sample)] %>%
+  pivot_longer(cols = -gene_name, names_to = "sample", values_to = "gene_expr") %>%
+  left_join(metadata_scaled, by = "sample")
+exprmx_long_TPM <- exprmx_long_TPM %>%
+  inner_join(hox_mapping, by = "gene_name")
+
+# Crucial: Order the gene_name factor so they appear in sequence within the blocks
+exprmx_long_TPM$gene_name <- factor(exprmx_long_TPM$gene_name, levels = gene_order)
+# also order the samples
+exprmx_long_TPM$sample <- factor(exprmx_long_TPM$sample, levels = unique(exprmx_long_TPM$sample))
+exprmx_long_TPM$Target <- factor(exprmx_long_TPM$Target, levels = c("STOP_GFP", "STOP_MYCN"))
+
+p_dot_samples <- ggplot(exprmx_long_TPM[exprmx_long_TPM$Target == "STOP_GFP", ], 
+                        aes(x = gene_name, y = forcats::fct_rev(factor(sample)))) + 
+  geom_point(aes(size = gene_expr, color = gene_expr)) +
+  
+  # Grouping into blocks
+  facet_grid(. ~ gene_group, scales = "free_x", space = "free_x") +
+  
+  # Styling the color and size
+  scale_color_gradient(low = "lightgrey", high = "red", name = "Average\nExpression") +
+  scale_size_continuous(range = c(1, 8), name = "Average\nExpression") +
+  guides(size = "none") +
+  
+  theme_bw() +
+  labs(x = NULL, y = "Cell Type") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold.italic"),
+    axis.text.y = element_text(size = 8),
+    # Styling the facet labels (the "Blocks")
+    strip.background = element_rect(fill = "gray90", color = "black"),
+    strip.text = element_text(face = "bold", size = 10),
+    panel.spacing = unit(0, "lines"), # Removes gaps between blocks for a seamless look
+    panel.border = element_rect(color = "black", fill = NA),
+    panel.grid.major = element_line(color = "gray95"),
+    legend.position = "right"
+  )
+
+#print(p_dot_samples)
+outfig <- file.path(figfolder, "selected_genes_tpm_dotplot_deltaonly.pdf")
+ggsave(outfig, plot=p_dot_samples, width=10, height=10)
+
+# all samples
+p_dot_samples <- ggplot(exprmx_long_TPM, 
+                        aes(x = gene_name, y = forcats::fct_rev(factor(sample)))) +
+  # Size and Color both represent the expression level
+  geom_point(aes(size = gene_expr, color = gene_expr)) +
+  
+  # Styling the color scale (Seurat-like red gradient)
+  scale_color_gradient(low = "lightgrey", high = "red", name = "TPM") +
+  
+  # Adjust the dot size range
+  scale_size_continuous(range = c(1, 8), name = "TPM") +
+  guides(size = "none") +
+  
+  # Optional: Facet by condition to visually group your samples
+  facet_grid(Target ~ ., scales = "free_y", space = "free_y") +
+  
+  theme_bw() +
+  labs(x = "Genes", y = "Samples") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold.italic"),
+    axis.text.y = element_text(size = 8),
+    strip.text.y = element_text(angle = 0, face = "bold"), # Keep condition labels horizontal
+    panel.grid.major = element_line(color = "gray95"),
+    legend.position = "right"
+  )
+outfig <- file.path(figfolder, "selected_genes_tpm_dotplot.pdf")
+ggsave(outfig, plot=p_dot_samples, width=10, height=10)
+
+
+```
+
+Add other samples from GEO
+```{r read in other input data}
+#knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+
+#gsenum <- "GSE172184"
+vv_list <- list()
+exprmx_list <- list()
+samples_tmp_list <- list()
+samples_orig_list <- list()
+for (gsenum in c("GSE147635", "GSE94035")){
+  infile <- here(paste("Data", gsenum, sep="_"),
+                    "star_salmon/null.merged.gene.SummarizedExperiment.rds")
+  gse_tmp <- readRDS(infile)
+  colnames(gse_tmp) <- sub("_trimmed$", "", colnames(gse_tmp))
+  
+  annot_file_other <- here("Public_data", 
+                               paste("SraRunTable_", gsenum, ".csv", sep=""))
+  samples_annot_other <- read.csv(annot_file_other)
+  table(samples_annot_other$tissue)
+  #samples_tmp <- samples_annot[, c("Run", "tissue")]
+  samples_tmp <- samples_annot_other
+  #colnames(samples_tmp)[colnames(samples_tmp)=="Run"] <- "Sample"
+  colnames(samples_tmp)[colnames(samples_tmp)=="tissue"] <- "Type"
+  # remove missing data
+  samples_tmp <- samples_tmp[samples_tmp$Run %in% colnames(gse_tmp),]
+  # add all relevant information in the sample name
+  if (gsenum == "GSE147635"){
+    samples_tmp$Sample <- paste(samples_tmp$Sample.ID,
+                              "DOD", samples_tmp$DOD,
+                              "MYCN", samples_tmp$MYCN_amp, sep="_")
+  }
+  if (gsenum == "GSE94035"){
+    samples_tmp$Sample <- paste(samples_tmp$patient,
+                                samples_tmp$Tissue.extended, sep="_")
+  }
+  
+  samples_tmp_list[[gsenum]] <- samples_tmp[, c("Sample", "Type")]
+  samples_tmp_list[[gsenum]]$gse <- gsenum  
+  samples_orig_list[[gsenum]] <- samples_tmp
+  samples_orig_list[[gsenum]]$gse <- gsenum  
+
+  # Option A: Additive Design Matrix
+  design_gse <- model.matrix(~ Type, data = samples_tmp_list[[gsenum]])
+  rownames(design_gse) <- samples_tmp_list[[gsenum]]$Sample
+  
+  # Extract the estimated counts and average effective lengths
+  counts_tmp <- assay(gse_tmp, "salmon.merged.gene_counts")
+  gene_lengths <- assay(gse_tmp, "salmon.merged.gene_lengths")
+  
+  # Convert estimated counts to a DGEList object (required by limma-voom)
+  dge_tmp <- edgeR::DGEList(counts = counts_tmp)
+  # change colnames to new names
+  colnames(dge_tmp) <- samples_tmp$Sample[match(colnames(dge_tmp), samples_tmp$Run)]
+  
+  # Perform filtering to remove genes with low counts
+  # A common threshold: Keep genes with CPM > 0.5 in at least two samples
+  keep <- filterByExpr(dge_tmp, design_gse)
+  dge_tmp <- dge_tmp[keep, , keep.lib.sizes=FALSE]
+  
+  # Apply the TMM normalization (a standard step in the limma-voom workflow)
+  dge_tmp <- calcNormFactors(dge_tmp)
+  
+  # Apply voom normalization. This step calculates log2-CPM values, applies
+  # the library size normalization (via the 'lib.size' in dge), and estimates
+  # a precision weight for each observation, modeling the mean-variance relationship.
+  vv_list[[gsenum]] <- voom(dge_tmp, design_gse, plot = F,
+            # The 'lib.size' in DGEList is sufficient for Salmon counts,
+            # but for the most precise limma-voom with Salmon data, we explicitly
+            # pass the average transcript length matrix as an offset:
+            # offset = log(gene_lengths[keep, ]) # (Uncomment this line for the most rigorous approach)
+  )
+  
+  # save & plot intermediate results
+  exprmx_list[[gsenum]] <- as_tibble(vv_list[[gsenum]]$E, rownames = "gene_id")
+  print(dim(exprmx_list[[gsenum]]))
+  # merge with gene annotation
+  exprmx_list[[gsenum]] <- right_join(gene_annot, exprmx_list[[gsenum]])
+  print(dim(exprmx_list[[gsenum]]))
+}
+
+# create a metadata with all information
+metadata_all <- metadata_scaled[, c("sample", "Target")]
+colnames(metadata_all)[which(colnames(metadata_all)=="sample")] <- "Sample"
+colnames(metadata_all)[colnames(metadata_all)=="Target"] <- "Type"
+metadata_all$gse <- "organoid"
+samples_tmp <- Reduce(rbind, samples_tmp_list)
+metadata_all <- rbind(metadata_all, samples_tmp)
+# add malignancy to metadata
+metadata_all$malignancy <- "malignant"
+metadata_all$malignancy[metadata_all$Type=="delta_MYCN"] <- "benign"
+metadata_all$malignancy[metadata_all$Type=="Ganglioneuroma"] <- "benign"
+metadata_all$malignancy[metadata_all$Type=="Non-tumor mononuclear cells (MNCs)"] <- "benign"
+metadata_all$Sample_lname <- paste(metadata_all$gse, metadata_all$Sample, sep=".")
+# # save ?
+# exprfile <- file.path(resfolder, "logCPM_gse.xlsx")
+# write.xlsx(exprmx, file = exprfile, colNames=T, rowNames=F)
+```
+
+Read in GDC data
+```{r read in data downloaded from GDC portal}
+# first,  read in GDC datasheet
+datasheet_file <- here("Data_GDC/gdc_sample_sheet.2025-11-13.tsv")
+datasheet <- read_tsv(datasheet_file)
+colnames(datasheet) <- make.names(colnames(datasheet))
+# now add path to the actual files
+datasheet <- datasheet %>%
+  mutate(
+    # Find the full path for each file name, searching recursively
+    full_path = map_chr(File.Name, ~ {
+      list.files(
+        path = here("Data_GDC"), 
+        pattern = paste0("^", .x, "$"), # Use regex to match exactly
+        full.names = TRUE, 
+        recursive = TRUE
+      )
+    })
+  )
+# for each sample, read in the counts data
+counts_list <- list()
+for (ID in datasheet$File.ID){
+  ri <- which(datasheet$File.ID==ID)
+  header <- read_tsv(datasheet$full_path[ri], skip=1, n_max=1)
+   tmp  <- read_tsv(datasheet$full_path[ri], skip=6, col_names=F)
+  colnames(tmp) <- colnames(header)
+  counts_list[[ID]] <- tmp[, c("gene_id", "gene_name", "tpm_unstranded")]
+  colnames(counts_list[[ID]])[colnames(counts_list[[ID]])=="tpm_unstranded"] <- ID
+}
+```
+
+
+Analyse all samples together using limma and obtain a combined expression matrix (not only the gse samples)
+```{r reanalyse with other input data}
+#knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+
+# nf-core format: gene_id, gene_name, then one column per sample
+organoid_counts <- as.matrix(counts_df[, !(colnames(counts_df) %in% c("gene_id", "gene_name"))])
+rownames(organoid_counts) <- counts_df$gene_id
+
+# Keep the same sample order as in the organoid metadata
+organoid_counts <- organoid_counts[, metadata_scaled$sample]
+
+expr_list_counts <- list("organoid"=organoid_counts)
+for (gsenum in c("GSE147635", "GSE94035")) {
+  infile <- here(paste("Data", gsenum, sep = "_"),
+                 "star_salmon/null.merged.gene.SummarizedExperiment.rds")
+  gse_tmp <- readRDS(infile)
+  # use previously defined sample names
+  colnames(gse_tmp) <- samples_orig_list[[gsenum]]$Sample[
+    match(colnames(gse_tmp), samples_orig_list[[gsenum]]$Run)]
+
+  # extract the count matrix right away
+  expr_list_counts[[gsenum]] <- assay(gse_tmp, "salmon.merged.gene_counts")
+}
+
+# Check that all have identical gene rownames (they should)
+all(sapply(expr_list_counts, 
+    function(x) identical(rownames(x), rownames(expr_list_counts[[1]]))))
+# if FALSE, you can do an inner join on rownames later
+
+# Combine them by columns (samples)
+expr_all_counts <- do.call(cbind, expr_list_counts)
+dim(expr_all_counts)
+
+# now provide a design matrix
+metadata_all$Type <- as.factor(metadata_all$Type)
+metadata_all$gse  <- as.factor(metadata_all$gse)
+metadata_all$malignancy  <- as.factor(metadata_all$malignancy)
+design_all  <- model.matrix(~ 0 + malignancy, data = metadata_all) # use this type of model matrix before as well???
+#colnames(design_all) <- levels(metadata_all$Type)
+rownames(design_all) <- metadata_all$Sample
+
+# now the diff analysis and corrected expression
+# Convert estimated counts to a DGEList object (required by limma-voom)
+dge_all <- edgeR::DGEList(counts = expr_all_counts)
+
+# Perform filtering to remove genes with low counts
+# A common threshold: Keep genes with CPM > 0.5 in at least two samples
+keep <- filterByExpr(dge_all, design_all)
+dge_all <- dge_all[keep, , keep.lib.sizes=FALSE]
+
+# Apply the TMM normalization (a standard step in the limma-voom workflow)
+dge_all <- calcNormFactors(dge_all)
+
+# Apply voom normalization. This step calculates log2-CPM values, applies
+# the library size normalization (via the 'lib.size' in dge_all), and estimates
+# a precision weight for each observation, modeling the mean-variance relationship.
+vv_all <- voom(dge_all, design_all, plot = F,
+          # The 'lib.size' in DGEList is sufficient for Salmon counts,
+          # but for the most precise limma-voom with Salmon data, we explicitly
+          # pass the average transcript length matrix as an offset:
+          # offset = log(gene_lengths[keep, ]) # (Uncomment this line for the most rigorous approach)
+)
+```
+
+
+Combine GDC counts data with all of the previous data
+```{r combine GDC counts data with previous data}
+# combine expression data with GDC data
+expr_GDC <- counts_list %>% purrr::reduce(full_join, by = c("gene_id", "gene_name"))
+#anyNA(expr_GDC)
+expr_GDC$gene_name <- NULL
+expr_GDC[, 2:ncol(expr_GDC)] <- log2(expr_GDC[, 2:ncol(expr_GDC)]+1)
+expr_all_tbl <- as_tibble(vv_all$E, rownames="gene_id")
+
+# harmonize ensembl ID-s
+expr_GDC$gene_id_clean <- sub("\\..*", "", expr_GDC$gene_id)
+
+mapping <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = expr_GDC$gene_id_clean,
+  keytype = "ENSEMBL",
+  columns = c("ENSEMBL", "SYMBOL")
+)
+
+expr_GDC$gene_current <- mapping$SYMBOL[match(expr_GDC$gene_id_clean, mapping$ENSEMBL)]
+
+# remove NA rows
+expr_GDC <- expr_GDC %>% drop_na(gene_current)
+# remove columns that we don't need any more
+# expr_GDC$gene_id <- NULL
+expr_GDC$gene_current <- NULL # if biomart annotation
+expr_GDC$gene_id_clean <- NULL
+
+# expr_combined_tbl <- inner_join(expr_all_tbl, expr_GDC, by=c("gene_id"="gene_current")) 
+expr_combined_tbl <- inner_join(expr_all_tbl, expr_GDC, by=c("gene_id"="gene_id"))   # if biomart annotation
+expr_combined <- as.matrix(as.data.frame(expr_combined_tbl[, 2:ncol(expr_combined_tbl)]))
+rownames(expr_combined) <- expr_combined_tbl$gene_id
+  
+metadata_GDC <- datasheet[, c("File.ID", "Tumor.Descriptor")]
+colnames(metadata_GDC) <- c("Sample", "Type")
+metadata_GDC$gse <- "TARGET-NBL"
+metadata_GDC$malignancy <- "malignant"
+metadata_GDC$Sample_lname <- metadata_GDC$Sample
+metadata_combined <- bind_rows(metadata_all, metadata_GDC)
+
+```
+
+Calculate the differential gene expression for organoid data only and save the results.
+```{r calculate differential gene expression}
+fit <- lmFit(vv$E[, match(rownames(design_additive),colnames(vv$E))], 
+             design=design_additive)
+# save result for further use
+outfile <- file.path(resfolder, "limma_fit_expr.rds")
+saveRDS(fit, file=outfile)
+
+# # also write to file
+# gene_expr_average <- fit$coefficients
+# colnames(gene_expr_average) <- samples_annot_short[match(
+#               colnames(gene_expr_average), samples_annot_short$groupID), "group", drop=T]
+# gene_expr_average <- as_tibble(gene_expr_average, rownames="Gene_ID")
+# # put into a list
+# exprout <- list()
+# # add gene & sample annotation
+# exprout[["mean"]]  <- genes_annot[match(gene_expr_average$Gene_ID,
+#                                         genes_annot$Gene_ID),1:3]
+# # add average gene expression
+# exprout[["mean"]]  <- left_join(exprout[["mean"]] ,  
+#                                 gene_expr_average, by="Gene_ID")
+# outfile <- file.path(resfolder, "logCPM_mean.xlsx")
+# write.xlsx(exprout[["mean"]] , file=outfile)
+
+# contrasts 
+contr.matrix <- makeContrasts(
+  kolf2_vs_EpiC    = Cell_LineH2,
+  STOP_vs_delta    = -TargetSTOP_GFP,   # STOP_MYCN - delta_MYCN
+  gRNA2_vs_gRNA1   = gRNAgRNA2,
+  levels = design_additive
+)
+
+fitc <- contrasts.fit(fit, contr.matrix)
+fite <- eBayes(fitc) ## gives moderated t-statistics
+# save result for further use
+outfile <- file.path(resfolder, "limma_fit_diffexpr.rds")
+saveRDS(fite, file=outfile)
+
+# also write out to human readable file
+lthr <- 1; pthr <- 0.05
+thrchar <- paste(sprintf("lfc%01d", lthr), 
+                   sprintf("adjp%.2f", pthr), sep="_")
+outdata <- list()
+outdata_signif <- list() # only write out genes whose diff expr is signif
+for (cf in colnames(fite$coefficients)){
+  toptt <- limma::topTable(fite, coef=cf, sort.by = "logFC",
+          number=nrow(fite$coefficients))
+  toptt <- as_tibble(toptt, rownames = "Gene_ID")
+  # add annotation
+  toptt <- left_join(toptt, gene_annot, by=c("Gene_ID"="gene_id"))
+  lname <- substr(cf,1, min(nchar(cf), 31)) # for each tab name, a maximum of 31 length is allowed
+  outdata[[lname]] <- toptt
+
+  # repeat with significant genes only
+  toptt_thr <- limma::topTable(fite, coef=cf, sort.by = "logFC",
+                p.value=pthr, lfc=lthr, number=nrow(fite$coefficients))
+  toptt_thr <- as_tibble(toptt_thr, rownames = "Gene_ID")
+  # add annotation
+  toptt_thr <- left_join(toptt_thr, gene_annot, by=c("Gene_ID"="gene_id"))
+  outdata_signif[[lname]] <- toptt_thr
+}
+# write into a compound excel file
+outfile <- file.path(resfolder, "diffexpr_all.xlsx")
+write.xlsx(outdata, file = outfile, colNames=T, rowNames=F)
+outfile_signif <- outfile <- file.path(resfolder, 
+                     paste("diffexpr_", thrchar, "_signif.xlsx", sep=""))
+write.xlsx(outdata_signif, file = outfile_signif, colNames=T, rowNames=F)
+
+# calculate number of diff expressed genes for "kolf2_vs_EpiC"
+table(outdata_signif[["kolf2_vs_EpiC"]]$seqnames)
+```
+
+
+Calculate the differential gene expression based on the extended count matrix
+```{r calculate differential gene expression between ganglioneuroma vs STOP}
+
+design_all_types  <- model.matrix(~ 0 + Type, data = metadata_all)
+colnames(design_all_types) <- make.names(colnames(design_all_types))
+rownames(design_all_types) <- metadata_all$Sample_lname
+fit_all <- lmFit(vv_all$E[, match(rownames(design_all_types),colnames(vv_all$E))], 
+             design=design_all_types)
+# # save result for further use
+# outfile <- file.path(resfolder, "limma_fit_expr.rds")
+# saveRDS(fit, file=outfile)
+
+# contrasts 
+contr.matrix <- makeContrasts(
+  STOP_minus_ganglioneuroma    =  TypeSTOP_MYCN-TypeGanglioneuroma,   # STOP_MYCN - delta_MYCN
+  tumor_minus_ganglioneuroma_both = (TypePrimary.neuroblastoma.cell.line+TypeTumor.cells.from.the.primary.tumor+
+                                 TypeDisseminated.tumor.cells..DTCs.+TypeTumor)/4 - TypeGanglioneuroma,
+  tumor_minus_ganglioneuroma_GSE147635 = (TypePrimary.neuroblastoma.cell.line+
+                                 TypeTumor.cells.from.the.primary.tumor)/2 - TypeGanglioneuroma,
+  levels = colnames(design_all_types)
+)
+
+fitc_all <- contrasts.fit(fit_all, contr.matrix)
+fite_all <- eBayes(fitc_all) ## gives moderated t-statistics
+# # save result for further use
+# outfile <- file.path(resfolder, "limma_fit_diffexpr.rds")
+# saveRDS(fite, file=outfile)
+
+# also write out to human readable file
+lthr <- 1; pthr <- 0.05
+thrchar <- paste(sprintf("lfc%01d", lthr), 
+                   sprintf("adjp%.2f", pthr), sep="_")
+outdata_all <- list()
+outdata_all_signif <- list() # only write out genes whose diff expr is signif
+for (cf in colnames(fite_all$coefficients)){
+  toptt <- limma::topTable(fite_all, coef=cf, sort.by = "logFC",
+          number=nrow(fite_all$coefficients))
+  toptt <- as_tibble(toptt, rownames = "Gene_ID")
+  # add annotation
+  toptt <- left_join(toptt, gene_annot, by=c("Gene_ID"="gene_id"))
+  lname <- substr(cf,1, min(nchar(cf), 31)) # for each tab name, a maximum of 31 length is allowed
+  outdata_all[[lname]] <- toptt
+
+  # repeat with significant genes only
+  toptt_thr <- limma::topTable(fite_all, coef=cf, sort.by = "logFC",
+                p.value=pthr, lfc=lthr, number=nrow(fite_all$coefficients))
+  toptt_thr <- as_tibble(toptt_thr, rownames = "Gene_ID")
+  # add annotation
+  toptt_thr <- left_join(toptt_thr, gene_annot, by=c("Gene_ID"="gene_id"))
+  outdata_all_signif[[lname]] <- toptt_thr
+}
+# write into a compound excel file
+outfile <- file.path(resfolder, "diffexpr_ganglioneuroma_vs_STOP_MYCN.xlsx")
+write.xlsx(outdata_all, file = outfile, colNames=T, rowNames=F)
+outfile_signif <- outfile <- file.path(resfolder, 
+                     paste("diffexpr_ganglioneuroma_vs_STOP_MYCN_", thrchar, "_signif.xlsx", sep=""))
+write.xlsx(outdata_all_signif, file = outfile_signif, colNames=T, rowNames=F)
+
+```
+
+
+
+
+Heatmap using only STOP_MYCN, ganglioneuroma, neuroblastoma, neuroblastoma primary cell line and DTC samples
+```{r plot heatmap with manually selected samples from GSE94035 and GSE147635}
+  metadata_tmp1 <- metadata_combined[metadata_combined$gse %in% c("GSE147635", "organoid"),]
+# additionally, from "GSE147635" keep all samples, from "GSE94035" keep non-relapsed MNC and DTC samples as well
+  keep_GSE94035 <- c(grep("^GSE94035.*DTCs at diagnosis$", metadata_combined$Sample_lname),
+                      grep("^GSE94035.*MNCs at diagnosis$", metadata_combined$Sample_lname))
+  metadata_tmp2 <- metadata_combined[keep_GSE94035,]
+  metadata_tmp <- bind_rows(metadata_tmp1, metadata_tmp2)
+  hwidth=13; hheight=26
+  cf_cur <- "tumor_minus_ganglioneuroma_GSE147635"
+  
+  # repeat with significant genes only
+ lthr <- 5; pthr <- 0.001
+ # use higher lthr (too many genes to plot)
+ # lthr <- 5.5; pthr <- 0.001
+ 
+ #cf = "STOP_minus_ganglioneuroma"
+ #cf <- "tumor_minus_ganglioneuroma_both"
+ ct <- "tumor_minus_ganglioneuroma_GSE147635"
+  toptt_thr <- limma::topTable(fite_all, coef=cf, sort.by = "logFC",
+                p.value=pthr, lfc=lthr, number=nrow(fite$coefficients))
+  toptt_thr <- as_tibble(toptt_thr, rownames = "Gene_ID")
+  # add annotation
+  toptt_thr <- left_join(toptt_thr, gene_annot, by=c("Gene_ID"="gene_id"))
+  # add MYCN
+  MYCN_ID <- gene_annot$gene_id[gene_annot$gene_name=="MYCN"]
+  
+  # remove lncRNA-s
+  toptt_thr <- toptt_thr %>% 
+    filter(grepl("protein_coding", gene_type, ignore.case = TRUE))
+  
+  print("toptt dim:")
+  print(dim(toptt_thr))
+
+# repeat once more with more genes
+# remove delta_MCYN samples
+delta_MYCN_samples <- grep("STOP_GFP", metadata_tmp$Sample)
+keep_samples <- setdiff(c(1:nrow(metadata_tmp)), delta_MYCN_samples)
+#expr_heat_mx <- expr_combined[, colnames(expr_combined) %in% metadata_tmp$Sample_lname[keep_samples]]
+
+expr_all <- as.matrix(as.data.frame(expr_all_tbl[, 2:ncol(expr_all_tbl)]))
+rownames(expr_all) <- expr_all_tbl$gene_id
+expr_heat_mx <- as.matrix(expr_all[, colnames(expr_all) %in% metadata_tmp$Sample_lname[keep_samples]])
+dim(expr_heat_mx)
+expr_heat_mx <- expr_heat_mx[rownames(expr_heat_mx) %in% c(toptt_thr$Gene_ID,  MYCN_ID),]
+dim(expr_heat_mx)
+rownames(expr_heat_mx) <- gene_annot$gene_name[match(rownames(expr_heat_mx), gene_annot$gene_id)]
+
+# to add bottom bar:
+annot_data <- metadata_tmp[match(colnames(expr_heat_mx), metadata_tmp$Sample_lname), ]
+bottom_bar <- ComplexHeatmap::HeatmapAnnotation(
+  Group = annot_data$Type, 
+  col = list(Group = c(
+    "Ganglioneuroma" = "black",
+    "Non-tumor mononuclear cells (MNCs)" = "orange",
+    "Disseminated tumor cells (DTCs)" = "yellow",
+    "Tumor cells from the primary tumor" = "red",
+    "STOP_MYCN" = "darkgreen",
+    "Primary neuroblastoma cell line" = "blue"
+  )),
+  show_annotation_name = FALSE,
+  show_legend = FALSE
+)
+
+# there would be too many genes to show the names - only show highlighted ones
+key_genes <- c("MYCN", "AXL", "ROBO2", "HLA-DPB1") 
+gene_indices <- match(key_genes, rownames(expr_heat_mx))
+gene_indices <- na.omit(gene_indices)
+
+# Create a right annotation with connector lines
+gene_labels <- rowAnnotation(
+  foo = anno_mark(
+    at = gene_indices,
+    labels = rownames(expr_heat_mx)[gene_indices],
+    labels_gp = gpar(fontsize = 7, fontface = "bold.italic"),
+    link_width = unit(5, "mm"),
+    padding = unit(1, "mm")
+  )
+)
+
+# select top differentially expressed genes
+ht <- ComplexHeatmap::Heatmap(expr_heat_mx,
+                        name = "logCPM\n",
+                        clustering_method_rows = "complete",
+                        row_names_gp = gpar(fontsize = 3),
+                        #show_row_names = FALSE,
+                        #right_annotation = gene_labels, # use these 2 rows if selected gene names are needed
+                        column_names_gp = gpar(fontsize = 12),
+                        column_names_max_height = unit(10, "cm"),
+                        bottom_annotation = bottom_bar,
+                        show_row_dend = FALSE,               #hide the left dendrogram
+                        column_dend_height = unit(3, "cm"),  # enlarge the top dendrogram
+                        # Pass a list of parameters to control the heatmap's main legend
+    heatmap_legend_param = list(
+        title_gp = gpar(
+            fontsize = 26,     # Font size of the legend title
+            fontface = "plain" # Font face of the legend title
+        ),
+        # Change the Legend Labels (Text):
+        labels_gp = gpar(
+            fontsize = 24       # Font size of the legend labels
+        ),
+        # Increase the size of the legend bar (for continuous legends)
+        legend_height = unit(10, "cm")
+    ))
+#plot(ht)
+tiff(file = file.path(figfolder, paste("heatmap_neuroblastoma_", "selected_samples", ".tiff", sep="")),
+    width = hwidth, height = hheight, units = "in", res=300)
+# pdf(file = file.path(figfolder, paste("heatmap_neuroblastoma_", "selected_samples", ".pdf", sep="")), 
+#     width = hwidth, height = hheight)
+draw(ht)
+dev.off()
+
+```
+
+
+
+
+Volcano plot for STOP vs delta
+```{r MYCN volcano plot}
+# needs to be added later: highlight some genes
+pthr <- 0.05
+lthr <- 1
+toptt_MYCN <- limma::topTable(fite, coef="STOP_vs_delta", sort.by = "none",
+        number=nrow(fite$coefficients))
+toptt_MYCN <- as_tibble(toptt_MYCN, rownames = "Gene_ID")
+toptt_MYCN <- left_join(toptt_MYCN, gene_annot, by=c("Gene_ID"="gene_id"))
+
+
+    # add whether it was differentially expressed
+toptt_MYCN$diffexpressed <- "NO"
+toptt_MYCN$diffexpressed[toptt_MYCN$logFC > lthr  & toptt_MYCN$adj.P.Val < pthr ] <- "UP"
+toptt_MYCN$diffexpressed[toptt_MYCN$logFC < -lthr  & toptt_MYCN$adj.P.Val < pthr ] <- "DOWN"
+toptt_MYCN$diffexpressed <- factor(toptt_MYCN$diffexpressed, levels=c("NO", "UP", "DOWN"))
+
+# # add text for selected & top genes
+# selected_genes <- c("ABCC1", "ABCC3", "ABCG2", "CDK1", "CDK2", "CDK4", "CDK5", 
+#     "CDK7", "CDK9", "DNMT1", "DNMT3A", "DNMT3B", "DCK", "FGFR1", "KIT", "PDGFRA", 
+#     "RRM1", "RRM2", "RRM2B", "SAMHD1","FLT1", "FDPS", "XPO1", "IDH1", "IDH2", "BCL2", "PLK1",
+#     "TOP2A", "NEDD8", "MDM2", "ABCB1", "BTK", "EGFR", "FLT3", "FTO", "PSMB5")
+# keep_genes <- genes_annot$Gene_ID[match(selected_genes, 
+#                                  genes_annot$name)]
+# keep_ind <- match(keep_genes, rownames(toptt_HFF))
+keep_ind <- c()
+# also the "large" differential expression ones
+# lfc_spec <- 7.5
+# adjp_spec <- 2
+lfc_spec <- 15
+adjp_spec <- 10
+large_genes_ind <- which(abs(toptt_MYCN$logFC)>=lfc_spec |
+                       -log10(toptt_MYCN$adj.P.Val)>=adjp_spec)
+large_genes_names <- toptt_MYCN$gene_name[large_genes_ind]
+# create a small dataframe with the labels
+text_df <- toptt_MYCN[c(keep_ind, large_genes_ind), ]
+
+
+# p <- ggplot(data=toptt_HFF, aes(x=logFC, y=-log10(adj.P.Val), 
+#                                  col=diffexpressed)) +
+p <- ggplot(data=toptt_MYCN, aes(x=logFC, y=-log10(adj.P.Val), 
+                                 col=diffexpressed)) +
+              geom_point() + 
+              geom_point(data = subset(toptt_MYCN, gene_name == "MYCN"),    
+                         shape = 21,          # filled circle with outline
+                        fill = "red",      # red center (or "black" for filled)
+                        color = "black",     # black border
+                        stroke = 1.2         # line thickness of the border
+                      ) +
+              theme_minimal() +
+              scale_color_manual(name="differentially\n expressed",
+                values=c("DOWN"="blue", "NO"="gray", "UP"="red")) +
+              geom_vline(xintercept=c(-lthr, lthr), col="black", linetype="dashed") +
+              geom_hline(yintercept=-log10(pthr), col="black", linetype="dashed")+
+              # geom_text(data=text_df, aes(x=logFC, y=-log10(adj.P.Val),
+              #                             label=gene_name), color="black",
+              #            size=2, nudge_y = 0.05)+
+                geom_text_repel(
+                  data = text_df,
+                  aes(label = gene_name),
+                  size = 2,
+                  box.padding = 0.4,     # distance between text and points
+                  point.padding = 0.2,   # distance between text and its point
+                  segment.color = "gray50",  # connecting line color
+                  max.overlaps = Inf     # don’t drop labels
+                ) +
+                geom_text_repel(
+                  data = subset(toptt_MYCN, gene_name == "MYCN"),
+                  aes(label = gene_name),
+                  size = 4,
+                  color = "black",
+                  fontface = "bold",
+                  box.padding = 0.5,
+                  point.padding = 0.3,
+                  segment.color = "black"
+                ) +
+              theme_gray(base_size = 20)+
+              #xlab(bquote(Log[2] * bgroup("(", "Fold Change", ")" )))+
+              #ylab(bquote(-Log[10] * bgroup("(", "adjusted P value", ")" )))
+              xlab(bquote(log[2] ~ (fold ~ change)))+
+              ylab(bquote(-log[10] ~ (adjusted ~ p ~ value)))
+outfig <- file.path(figfolder, "volcano_geneset_MYCN.pdf")
+ggsave(p, file=outfig, width=10, height=7.5)
+outfig <- file.path(figfolder, "volcano_geneset_MYCN.tiff")
+# ggsave(p, file=outfig, width=10, height=7.5)
+
+```
+
+Create a list of significantly up- and downregulated genes.
+```{r create a list of siginficantly up- and downregulated genes}
+lthr <- 1; pthr <- 0.05
+signif_diff <- list()
+for (cf in colnames(fite$contrasts)){
+  toptt <- topTable(fite, coef=cf,  
+                    number=nrow(fite$coefficients), sort.by = "none",
+                    p.value=pthr, lfc = lthr)
+  name_up <- paste(cf,"up", sep="_")
+  signif_diff[[name_up]] <- rownames(toptt)[toptt$logFC>0]
+  name_down <- paste(cf, "down", sep="_")
+  signif_diff[[name_down]] <- rownames(toptt)[toptt$logFC<0]
+}
+# number of genes
+setsizes <- unlist(lapply(signif_diff, length))
+```
+
+
+
+## Functional Enrichment Analysis
+
+To interpret the biological significance of the identified differentially expressed (DGE) and equivalent gene sets, we performed functional enrichment analysis using curated gene set collections from the Molecular Signatures Database (MSigDB).
+
+### Gene Set Collections
+We utilized three distinct categories of gene sets to capture a broad range of biological insights:
+
+* **Hallmark Gene Sets:** Represent specific, well-defined biological states or processes (e.g., hypoxia, inflammatory response) and provide a concise summary of the primary pathways involved.
+* **KEGG Medicus:** A subset of the Kyoto Encyclopedia of Genes and Genomes (KEGG) that focuses on the molecular networks of diseases and drug mechanisms, offering a more clinical and mechanistic perspective.
+* **GO Biological Process (GO:BP):** Comprehensive ontologies that describe the broader biological objectives (such as cell cycle or metabolic pathways) to which a gene contributes.
+
+This multi-faceted approach allows us to determine if the genes identified as "changing" or "stable" are non-randomly associated with specific biological functions or signaling pathways.
+
+```{r functional analysis, message=FALSE, warning=FALSE}
+geneset_collections <- list(
+  Hallmark = msigdbr(species = "Homo sapiens", collection = "H") %>%
+             dplyr::select(gs_name, gene_symbol, ensembl_gene),
+
+  KEGG_Medicus = msigdbr(species = "Homo sapiens", collection = "C2") %>%
+                 filter(gs_subcollection == "CP:KEGG_MEDICUS") %>%
+                 dplyr::select(gs_name, gene_symbol, ensembl_gene),
+
+  GO_Biological_Process = msigdbr(species = "Homo sapiens", collection = "C5") %>%
+                          filter(gs_subcollection == "GO:BP") %>%
+                          dplyr::select(gs_name, gene_symbol, ensembl_gene)
+)
+```
+
+# Create gene annotation
+```{r}
+# 1. Get your list of gene symbols from the object
+current_symbols <- rownames(seu.integrated)
+
+# 2. Query the database for IDs/Annotations
+gene_info <- select(org.Hs.eg.db,
+                    keys = current_symbols,
+                    columns = c("ENSEMBL", "GENENAME"),
+                    keytype = "SYMBOL")
+
+# 3. Clean up the query (handle potential duplicates/NAs)
+# (Optional: remove duplicates if a symbol maps to multiple Ensembl IDs)
+gene_info <- gene_info[!duplicated(gene_info$SYMBOL), ]
+# keep non-NA only
+gene_info <- gene_info[!is.na(gene_info$ENSEMBL),]
+```
+
+### Gene Set Enrichment Analysis (GSEA)
+
+While Overrepresentation Analysis (ORA) treats gene lists as unranked sets, **Gene Set Enrichment Analysis (GSEA)** utilizes the full spectrum of gene expression changes. This allows for the detection of subtle but coordinated shifts in entire biological pathways that might be missed by simple threshold-based filtering.
+
+#### 1. Analysis Workflow: Ranking and Running
+For each experimental contrast, we performed the following steps:
+* **Gene Ranking:** All genes were ranked by their $log_2(\text{Fold Change})$ in descending order. This ensures that the most upregulated genes are at the "top" of the list and the most downregulated genes are at the "bottom."
+* **Enrichment Calculation:** Using the `clusterProfiler::GSEA` function, we calculated a running sum statistic to identify pathways where genes are non-randomly distributed at either end of the ranked list.
+
+#### 2. Key Metrics and "Core Enrichment"
+The results are summarized using two primary metrics:
+* **Normalized Enrichment Score (NES):** A positive NES indicates the pathway is generally **activated** (enriched in upregulated genes), while a negative NES indicates the pathway is **suppressed** (enriched in downregulated genes).
+* **Core Enrichment:** We extracted the specific subset of "leading-edge" genes—those that contribute most significantly to the enrichment score—and reported them along with their individual $log_2(\text{Fold Change})$ values.
+
+#### 3. Visualization and Export
+* **Summary Dotplots:** For each comparison, we visualized the top 10 activated and top 10 suppressed pathways. The size of the points represents the significance ($-\log_{10}(\text{Adjusted P-Value})$), and the x-axis indicates the NES.
+
+#### Output file
+Results are saved to GSEA_differential_expression_[geneset_name]_results.xlsx file, where each tab contains the results of one of the contrasts and only those genesets are listed for each contrast where the adjusted p value <= 0.05. If the enrichment process resulted no genesets, then the contrast is not shown in the file. If none of the genesets were significant, then the corresponding tab is empty.
+
+After Calculate the differential gene expression for organoid data only and save the results.
+```{r GSEA for differentially expressed genes, message=FALSE, warning=FALSE, fig.width=12, fig.height=12}
+gsea_outer_list <- list()
+p_multi_list <- list()
+ for (gs_name in names(geneset_collections)){
+   current_t2g <- geneset_collections[[gs_name]]
+   
+    # add gene symbols
+    id_map <- current_t2g %>%
+    dplyr::select(ensembl_gene, gene_symbol) %>%
+    distinct() %>%
+      deframe() # Converts to a named vector
+   
+   # print("########################################")
+   # print(paste("#   Current gene set:", gs_name, "    #"))
+   # print("########################################")
+   gsea_res_list <- list()
+   # Iterate through your contrasts
+   # for (contr in colnames(fite$coefficients)) {
+   for (contr in c("STOP_vs_delta")) {
+     # print(paste("Current contrast:", contr))
+
+          # 1. Prepare the ranked list for GSEA
+     full_stats <- topTable(fite, coef = contr, number = Inf)
+
+     # Create a named vector for GSEA ranking
+     gene_list <- full_stats$logFC
+     names(gene_list) <- sub("\\..*$", "", rownames(full_stats))
+
+     # Create a lookup for the table mapping (clean Ensembl IDs)
+     lfc_lookup <- full_stats$logFC
+     names(lfc_lookup) <- sub("\\..*$", "", rownames(full_stats))
+
+     # Sort for GSEA
+     gene_list <- sort(gene_list, decreasing = TRUE)
+
+     # 2. Run GSEA
+     gsea_out <- clusterProfiler::GSEA(
+       geneList = gene_list,
+       TERM2GENE = current_t2g[, c("gs_name", "ensembl_gene")],
+       pvalueCutoff = 0.05,
+       verbose = FALSE
+     )
+
+     if (is.null(gsea_out) || nrow(as.data.frame(gsea_out)) == 0) {
+       next
+     }
+
+     # 3. Process results and map Symbols + LogFC
+     result_df <- as.data.frame(gsea_out)
+
+     # 4. Update the mapping logic to include LogFC for Core Enrichment
+     result_df_final <- result_df %>%
+       mutate(MSigDB_Link = paste0("<a href='https://www.gsea-msigdb.org/gsea/msigdb/cards/",
+                                   Description, "' target='_blank'>Link</a>")) %>%
+       mutate(core_enrichment_stats = map_chr(core_enrichment, function(id_string) {
+         # Split IDs (GSEA uses "/" as delimiter)
+         ids <- unlist(strsplit(id_string, "/"))
+
+         # Get Symbols from your id_map
+         symbols <- id_map[ids]
+         symbols[is.na(symbols)] <- ids[is.na(symbols)] # fallback to ID if symbol missing
+
+         # Get LogFC values from our lookup
+         logfcs <- lfc_lookup[ids]
+
+         # Format as "Symbol (LogFC)"
+         formatted <- paste0(symbols, " (", round(logfcs, 2), ")")
+
+         # Combine into a single string
+         paste(formatted, collapse = ", ")
+       })) %>%
+       # Select columns for the final table
+       dplyr::select(Description, NES, p.adjust, core_enrichment_stats, MSigDB_Link)
+
+     # Format p-value to scientific
+     result_df_final$p.adjust <- formatC(as.numeric(result_df_final$p.adjust), format = "e", digits = 2)
+     result_df_final$NES <- formatC(as.numeric(result_df_final$NES), format = "e", digits = 2)
+
+     # Add to list for Excel export
+     gsea_res_list[[contr]] <- result_df_final
+
+     # also add a figure
+     if (!is.null(gsea_out) && nrow(as.data.frame(gsea_out)) > 0) {
+
+     # 1. Identify the top 3 pathways by absolute NES
+     # (You can change this to show the most significant or specific pathways of interest)
+     top_pathways <- as.data.frame(gsea_out) %>%
+       arrange(desc(abs(NES))) %>%
+       slice_head(n = 3) %>%
+       pull(ID)
+
+     # # 2. Generate the plot for the top pathway
+     # # p1: The Enrichment Score curve
+     # # p2: The gene 'ticks' (hits)
+     # # p3: The rank-ordered gene list gradient
+     # p_gsea <- gseaplot2(gsea_out,
+     #                     geneSetID = top_pathways[1],
+     #                     title = paste("Top Pathway:", top_pathways[1]),
+     #                     subplots = 1:3,
+     #                     pvalue_table = TRUE)
+     # 
+     # # 3. Save the plot as a high-resolution PDF or PNG
+     # # Since gseaplot2 returns a ggplot-compatible object, we use ggsave
+     # plot_filename <- file.path(figfolder, paste0("GSEA_Plot_", contr, ".pdf"))
+     # 
+     # ggsave(plot_filename,
+     #        plot = p_gsea,
+     #        width = 10,
+     #        height = 8,
+     #        dpi = 300,
+     #        bg = "white")
+
+     # Optional: Plot multiple top pathways together
+     p_multi <- enrichplot::gseaplot2(gsea_out,
+                          geneSetID = top_pathways,
+                          title = paste("Top 3 Pathways in", contr))
+     p_multi_wrapped <- patchwork::wrap_plots(p_multi, ncol = 1, heights = c(2, 0.5, 0.5))
+     # p_multi_list[[contr]] <- p_multi_wrapped
+     subfolder <- file.path(figfolder, gs_name)
+     if (!file.exists(subfolder)) dir.create(subfolder)
+     ggsave(file.path(subfolder, paste0("GSEA_MultiPlot_", contr, ".pdf")),
+            plot = p_multi, width = 12, height = 9)
+     }
+   }
+
+   # Write out to Excel
+   outfile_gsea <- file.path(resfolder, paste("GSEA_differential_expression_", gs_name, "_results.xlsx", sep=""))
+   write.xlsx(gsea_res_list, file = outfile_gsea, colNames = TRUE)
+   gsea_outer_list[[gs_name]] <- gsea_res_list
+ }
+```
+
+
+```{r dotplot of GSEA results, fig.width=20, fig.height=20}
+for (gs_name in names(gsea_outer_list)){
+  gsea_res_list <- gsea_outer_list[[gs_name]]
+  plist <- list()
+  for (gsi in names(gsea_res_list)){
+    # create nice title:
+    gsi_title <- switch(gsi,
+      "TumorVsNormal"="Tumor vs Normal",
+      "STOP_vs_delta" = "STOP vs delta",
+      gsi
+    )
+    clean_title <- paste(gs_name, gsi_title, sep = " - ")
+    clean_title <- gsub("_", " ", clean_title)
+    
+    y <- gsea_res_list[[gsi]]
+    
+    # select activated and supressed genesets
+    y$NES <- as.numeric(y$NES)
+    y$p.adjust <- as.numeric(y$p.adjust)
+    y$direction <- "activated"
+    y$direction[y$NES<=0] <- "suppressed"
+    numact <- length(which(y$direction=="activated"))
+    numsupp <- length(which(y$direction=="suppressed"))
+
+    # pick top and bottom genesets
+    act_Nvals <- y$NES[y$direction=="activated"]
+    act_thr <- sort(act_Nvals, decreasing = T)[min(15, numact)]
+    act_keep <- which(y$direction=="activated" & y$NES >= act_thr)
+    sup_Nvals <- y$NES[y$direction=="suppressed"]
+    sup_thr <- sort(sup_Nvals, decreasing = F)[min(20, numsupp)]
+    sup_keep <- which(y$direction=="suppressed" & y$NES <= sup_thr)
+    y <- y[c(act_keep, sup_keep),]
+    
+    # sort by normalized enrichment
+    y <- y[order(y$NES, decreasing = F),]
+    # change the names of the gene sets
+    #y$Description <- tolower(y$Description)
+    #y$Description <- gsub(prefix[gsi], "", y$Description) # later if needed prefix <- c("gobp_", "kegg_", "hallmark_")
+    y$Description <- gsub("_", " ", y$Description)
+    y$Description <- str_to_sentence(y$Description)
+    y$Description <- gsub("Gobp", "GO:BP", y$Description)
+    y$Description <- gsub("dna", "DNA", y$Description)
+    y$Description <- gsub("Dna", "DNA", y$Description)
+    y$Description <- str_wrap(y$Description, width = 50) # width=30 is a good starting point for a 4-column layout
+    #y$Description <- nice_names$name[match(y$Description, nice_names$compare)]
+    y$size <- -log10(as.numeric(y$p.adjust))
+    
+    num_suppressed <- sum(y$direction == "suppressed")
+    sep_line_pos <- num_suppressed + 0.5
+    y$Description <- factor(y$Description, levels=y$Description)
+      p <- ggplot(y, 
+                    aes(x = NES, y = Description)) + 
+               geom_point(aes(size = size, color = direction))+
+               scale_color_manual(values = c("activated" = "firebrick", "suppressed" = "dodgerblue4")) +
+               
+              scale_size_continuous(
+                 name = "-log10(p.adj)", 
+                 limits = c(0, 20),      # <--- This is the fixed range
+                 breaks = c(2, 4, 6, 8) # <--- Fixed circle sizes in legend
+               ) +  
+              
+              # Only add it if both directions exist to avoid errors
+             {if(num_suppressed > 0 && num_suppressed < nrow(y)) 
+               geom_hline(yintercept = sep_line_pos, linetype = "solid", color = "gray80", size = 0.5)} +
+              
+               guides(size=guide_legend(title="-log(p.adjust)", ncol=1,byrow=TRUE,
+                                title.vjust=0.9, order=1))+
+               theme_bw(base_size = 16) +
+
+               theme(
+                 axis.text.y = element_text(size = 16, lineheight = 0.8),
+                 panel.grid.minor = element_blank(),
+                 legend.position="right",
+                      legend.box = "vertical",
+                     #axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+                     #strip.background =element_rect(fill=cfill),
+                     strip.text = element_text(colour = 'black'),
+                 legend.title = element_text(size = 16), # Legend title size
+                  legend.text = element_text(size = 14)                 # Legend item text size)
+               )+
+               ylab(NULL) + xlab("NES")+
+               #scale_size(range=c(3, 8))+
+               #scale_y_discrete(labels = function(x) str_wrap(x, width = 24))+
+               geom_vline(xintercept = 0, linetype="dashed")+
+               labs(title=clean_title)
+      #plot(p)
+      plist[[gsi]] <- p
+    # figfile <- file.path(figfolder, paste("GSEA_", gs_name, "_", gsi, "_enrich_dotplot.pdf", sep=""))
+    # ggsave(figfile, plot=p, width=14, height=6)
+  }
+  # plot together for the three genesets
+  pp_combined <- patchwork::wrap_plots(plist, ncol = 1) + 
+  patchwork::plot_layout(guides = "collect") & # Collects legends into one place
+  theme(legend.position = "right")
+  # plot(pp_combined)
+  ggsave(file.path(figfolder, paste("GSEA_", gs_name, "_enrich_dotplot_combined.pdf", sep="")), 
+         plot = pp_combined, width = 10, height = 10)
+}
+```

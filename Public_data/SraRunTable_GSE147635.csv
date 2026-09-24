@@ -1,0 +1,25 @@
+Run,Sample Name,source_name,tissue,Sample ID,DOD,MYCN_amp
+SRR11434490,GSM4437031,Ganglioneuroma,Ganglioneuroma,SC-GN_1,n,NA
+SRR11434491,GSM4437032,Ganglioneuroma,Ganglioneuroma,SC-GN_2,n,NA
+SRR11434492,GSM4437033,Ganglioneuroma,Ganglioneuroma,SC-GN_3,n,NA
+SRR11434493,GSM4437034,Ganglioneuroma,Ganglioneuroma,SC-GN_4,n,NA
+SRR11434494,GSM4437035,Ganglioneuroma,Ganglioneuroma,SC-GN_5,n,NA
+SRR11434495,GSM4437036,Ganglioneuroma,Ganglioneuroma,SC-GN_6,n,NA
+SRR11434496,GSM4437037,Primary neuroblastoma cell line established at the Children's Cancer Research Institute,Primary neuroblastoma cell line,STA-NB-6,n,n
+SRR11434497,GSM4437038,Primary neuroblastoma cell line established at the Children's Cancer Research Institute,Primary neuroblastoma cell line,STA-NB-7,y,y
+SRR11434498,GSM4437039,Primary neuroblastoma cell line established at the Children's Cancer Research Institute,Primary neuroblastoma cell line,STA-NB-15,y,y
+SRR11434499,GSM4437040,Tumor at diagnosis. Patient p02,Tumor cells from the primary tumor,NB-TU 02,NA,y
+SRR11434500,GSM4437041,Tumor at diagnosis. Patient p05,Tumor cells from the primary tumor,NB-TU 05,n,y
+SRR11434501,GSM4437042,Tumor at diagnosis. Patient p06,Tumor cells from the primary tumor,NB-TU 06,y,n
+SRR11434502,GSM4437043,Tumor at diagnosis. Patient p44,Tumor cells from the primary tumor,NB-TU 44,n,y
+SRR11434503,GSM4437044,Tumor at diagnosis. Patient p47,Tumor cells from the primary tumor,NB-TU 47,NA,y
+SRR11434504,GSM4437045,Tumor at diagnosis. Patient p48,Tumor cells from the primary tumor,NB-TU 48,y,y
+SRR11434505,GSM4437046,Tumor at diagnosis. Patient p49,Tumor cells from the primary tumor,NB-TU 49,n,y
+SRR11434506,GSM4437047,Tumor at diagnosis. Patient p50,Tumor cells from the primary tumor,NB-TU 50,n,n
+SRR11434507,GSM4437048,Tumor at diagnosis. Patient p52,Tumor cells from the primary tumor,NB-TU 52,y,y
+SRR11434508,GSM4437049,Tumor at diagnosis. Patient p53,Tumor cells from the primary tumor,NB-TU 53,y,y
+SRR11434509,GSM4437050,Tumor at diagnosis. Patient p54,Tumor cells from the primary tumor,NB-TU 54,y,y
+SRR11434510,GSM4437051,Tumor at diagnosis. Patient p55,Tumor cells from the primary tumor,NB-TU 55,y,n
+SRR11434511,GSM4437052,Tumor at diagnosis. Patient p57,Tumor cells from the primary tumor,NB-TU 57,n,y
+SRR11434512,GSM4437053,Tumor at diagnosis. Patient p62,Tumor cells from the primary tumor,NB-TU 62,y,n
+SRR11434513,GSM4437054,Tumor at diagnosis. Patient p63,Tumor cells from the primary tumor,NB-TU 63,y,n
