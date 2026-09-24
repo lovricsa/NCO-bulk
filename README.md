@@ -11,6 +11,7 @@ Run the following R snippet to automatically check for and install any missing p
 ```r
 # List of required packages
 required_packages <- c(
+  "ggplot2", "ggrepel",    # for some plots
   "tidyverse",            # Includes ggplot2, dplyr, tidyr, readr, purrr, forcats, tibble
   "limma",                # Differential expression analysis
   "edgeR",                # Normalization and DGEList
@@ -20,7 +21,10 @@ required_packages <- c(
   "here",                 # Relative path management
   "AnnotationDbi",        # Database mapping
   "org.Hs.eg.db",         # Human gene annotation database
-  "rtracklayer"           # Importing GTF annotation files
+  "rtracklayer",          # Importing GTF annotation files
+  "msigdbr", 
+  "org.Hs.eg.db",
+  "AnnotationDbi" 
 )
 
 # Ensure BiocManager is installed
@@ -89,7 +93,7 @@ Reproduces the bulk RNA-seq analysis
 - `Data/GSE335741_salmon.merged.gene_tpm.tsv`: Organoid gene-level TPM values (provided).
 - `Data/samplesheet.csv`: Organoid sample sheet (provided).
 - `Gencode/gencode.v49.primary_assembly.annotation.gtf`: GENCODE v49 annotation. Download from Gencode.
-- `Data_GSE147635/star_salmon/null.merged.gene.SummarizedExperiment.rds` and `Data_GSE94035/star_salmon/null.merged.gene.SummarizedExperiment.rds`: nf-core (STAR/Salmon) gene-level `SummarizedExperiment` objects obtained from the public datasets (provided).
+- `Data_GSE147635/star_salmon/null.merged.gene.SummarizedExperiment.rds` and `Data_GSE94035/star_salmon/null.merged.gene.SummarizedExperiment.rds`: nf-core (STAR/Salmon) gene-level `SummarizedExperiment` objects obtained from the public datasets (run the nf-core/rnaseq analysis on the public files to obtain or available upon request).
 - `Public_data/SraRunTable_GSE147635.csv` and `Public_data/SraRunTable_GSE94035.csv`: SRA run tables with sample annotation (provided).
 - `Data_GDC/gdc_sample_sheet.<date>.tsv` and the corresponding STAR gene-count files downloaded from the GDC portal (TARGET-NBL), located in subfolders of `Data_GDC/`. Download from the GDC portal.
 
