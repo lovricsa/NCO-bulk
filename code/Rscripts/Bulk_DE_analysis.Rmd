@@ -4,7 +4,7 @@ date: "`r Sys.Date()`"
 author: "Anna Lovrics"
 output:
   html_document:
-    css: assets/rany_style.css
+    # css: assets/rany_style.css
     df_print: paged
     highlight: tango
     theme: cosmo
@@ -49,22 +49,22 @@ invisible(lapply(packages, library, character.only = TRUE))
 
 ```{r folder structure}
 
-Datafolder     <- here("Data")
-# Subdirectories specifically isolated for this run's outputs
-Figures   <- here(file.path("Figures", "reference_mapping"))
-Data_calc <- here("Data_calculated")
-Data_public <- here("Data_public")
-Gencode_folder <- here("Gencode")
-Results   <- here("Results")
+on_codeocean <- dir.exists("/data") && dir.exists("/code")
 
-# mainfolder <- "/home/anna/Anna/Enzimhome_local/Projects/Neuroblastoma"
-datafolder <- here("Data") # here("Results_trimmed_321")
-calcfolder <- here("Data_calculated")
-if (!file.exists(calcfolder)) dir.create(calcfolder)
-figfolder <- here("Figures")
-if (!file.exists(figfolder)) dir.create(figfolder)
-resfolder <- here("Results")
-if (!file.exists(resfolder)) dir.create(resfolder)
+if (on_codeocean) {
+  datafolder     <- "/data"
+  Gencode_folder <- "/data/Gencode"
+  resfolder      <- "/results/Results"
+  figfolder      <- "/results/Figures"
+} else {
+  # Local RStudio: paths relative to the NCO-bulk project folder
+  datafolder <- here("data")
+  Gencode_folder <- here("data/Gencode")
+  resfolder  <- here("results/Results")
+  figfolder <- here("results/Figures")
+}
+
+
 ```
 
 Input for differential analysis is the count matrix, samples annotation and the design table. Gene annotation is also provided.
@@ -72,8 +72,8 @@ Input for differential analysis is the count matrix, samples annotation and the 
 knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
 
 # Read in TSV input data uploaded to GEO
-counts_file <- file.path(datafolder, "GSE335741_salmon.merged.gene_counts.tsv")
-tpm_file    <- file.path(datafolder, "GSE335741_salmon.merged.gene_tpm.tsv")
+counts_file <- file.path(datafolder, "Data_organoid", "GSE335741_salmon.merged.gene_counts.tsv")
+tpm_file    <- file.path(datafolder, "Data_organoid", "GSE335741_salmon.merged.gene_tpm.tsv")
 
 # Read gene counts table
 counts_df <- read.delim(counts_file, check.names = FALSE)
@@ -94,7 +94,7 @@ if ("gene_name" %in% colnames(counts_df)) {
 #colnames(counts) <- sub("_trimmed$", "", colnames(counts))
 
 # Read sample metadata
-annot_file <- file.path(datafolder, "samplesheet.csv")
+annot_file <- file.path(datafolder, "Data_organoid", "samplesheet.csv")
 metadata_scaled <- read.csv(annot_file)
 samples_split <- strsplit2(metadata_scaled$sample, "_")
 metadata_scaled$Cell_Line <- samples_split[,2]
@@ -294,12 +294,12 @@ exprmx_list <- list()
 samples_tmp_list <- list()
 samples_orig_list <- list()
 for (gsenum in c("GSE147635", "GSE94035")){
-  infile <- here(paste("Data", gsenum, sep="_"),
+  infile <- here(datafolder, paste("Data", gsenum, sep="_"),
                     "star_salmon/null.merged.gene.SummarizedExperiment.rds")
   gse_tmp <- readRDS(infile)
   colnames(gse_tmp) <- sub("_trimmed$", "", colnames(gse_tmp))
   
-  annot_file_other <- here("Public_data", 
+  annot_file_other <- here(datafolder,"Public_data", 
                                paste("SraRunTable_", gsenum, ".csv", sep=""))
   samples_annot_other <- read.csv(annot_file_other)
   table(samples_annot_other$tissue)
@@ -385,7 +385,7 @@ metadata_all$Sample_lname <- paste(metadata_all$gse, metadata_all$Sample, sep=".
 Read in GDC data
 ```{r read in data downloaded from GDC portal}
 # first,  read in GDC datasheet
-datasheet_file <- here("Data_GDC/gdc_sample_sheet.2025-11-13.tsv")
+datasheet_file <- file.path(datafolder,"Data_GDC/gdc_sample_sheet.2025-11-13.tsv")
 datasheet <- read_tsv(datasheet_file)
 colnames(datasheet) <- make.names(colnames(datasheet))
 # now add path to the actual files
@@ -394,7 +394,7 @@ datasheet <- datasheet %>%
     # Find the full path for each file name, searching recursively
     full_path = map_chr(File.Name, ~ {
       list.files(
-        path = here("Data_GDC"), 
+        path = here(datafolder,"Data_GDC"), 
         pattern = paste0("^", .x, "$"), # Use regex to match exactly
         full.names = TRUE, 
         recursive = TRUE
@@ -427,7 +427,7 @@ organoid_counts <- organoid_counts[, metadata_scaled$sample]
 
 expr_list_counts <- list("organoid"=organoid_counts)
 for (gsenum in c("GSE147635", "GSE94035")) {
-  infile <- here(paste("Data", gsenum, sep = "_"),
+  infile <- here(datafolder, paste("Data", gsenum, sep = "_"),
                  "star_salmon/null.merged.gene.SummarizedExperiment.rds")
   gse_tmp <- readRDS(infile)
   # use previously defined sample names
@@ -910,24 +910,6 @@ geneset_collections <- list(
 )
 ```
 
-# Create gene annotation
-```{r}
-# 1. Get your list of gene symbols from the object
-current_symbols <- rownames(seu.integrated)
-
-# 2. Query the database for IDs/Annotations
-gene_info <- select(org.Hs.eg.db,
-                    keys = current_symbols,
-                    columns = c("ENSEMBL", "GENENAME"),
-                    keytype = "SYMBOL")
-
-# 3. Clean up the query (handle potential duplicates/NAs)
-# (Optional: remove duplicates if a symbol maps to multiple Ensembl IDs)
-gene_info <- gene_info[!duplicated(gene_info$SYMBOL), ]
-# keep non-NA only
-gene_info <- gene_info[!is.na(gene_info$ENSEMBL),]
-```
-
 ### Gene Set Enrichment Analysis (GSEA)
 
 While Overrepresentation Analysis (ORA) treats gene lists as unranked sets, **Gene Set Enrichment Analysis (GSEA)** utilizes the full spectrum of gene expression changes. This allows for the detection of subtle but coordinated shifts in entire biological pathways that might be missed by simple threshold-based filtering.
@@ -948,7 +930,6 @@ The results are summarized using two primary metrics:
 #### Output file
 Results are saved to GSEA_differential_expression_[geneset_name]_results.xlsx file, where each tab contains the results of one of the contrasts and only those genesets are listed for each contrast where the adjusted p value <= 0.05. If the enrichment process resulted no genesets, then the contrast is not shown in the file. If none of the genesets were significant, then the corresponding tab is empty.
 
-After Calculate the differential gene expression for organoid data only and save the results.
 ```{r GSEA for differentially expressed genes, message=FALSE, warning=FALSE, fig.width=12, fig.height=12}
 gsea_outer_list <- list()
 p_multi_list <- list()

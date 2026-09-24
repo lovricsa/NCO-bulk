@@ -1,11 +1,5 @@
-Data/*.gz
-Data_calculated/
-Data_GSE147635/
-Data_GSE94035/
-Data_GDC/
-Gencode/
-Figures/
-Results/
+data/
+results/
 *.html
 .Rhistory
 .RData
