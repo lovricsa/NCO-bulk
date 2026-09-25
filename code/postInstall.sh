@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -e
 
+sudo apt-get update && sudo apt-get install -y pandoc
+
 Rscript -e 'install.packages("BiocManager", repos = "https://cloud.r-project.org")'
 
 # Bioconductor (the release is chosen automatically to match the R version)
